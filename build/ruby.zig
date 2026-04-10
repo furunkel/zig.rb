@@ -2,6 +2,12 @@ const std = @import("std");
 
 const Child = std.process.Child;
 
+fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const name_z = try allocator.dupeZ(u8, name);
+    const value_z = std.posix.getenv(name_z) orelse return null;
+    return try allocator.dupe(u8, value_z);
+}
+
 fn runRuby(allocator: std.mem.Allocator, code: []const u8) ![]u8 {
     const argv = [_][]const u8{ "ruby", "-e", code };
     const result = try Child.run(.{ .allocator = allocator, .argv = &argv });
@@ -17,11 +23,16 @@ pub const RubyConfig = struct {
 };
 
 pub fn getConfig(b: *std.Build) !RubyConfig {
-    var ruby_libdir: ?[]const u8 = std.posix.getenv("RUBY_LIBDIR");
-    var ruby_hdrdir: ?[]const u8 = std.posix.getenv("RUBY_HDRDIR");
-    var ruby_archhdrdir: ?[]const u8 = std.posix.getenv("RUBY_ARCHHDRDIR");
-    var ruby_version: ?[]const u8 = std.posix.getenv("RUBY_API_VERSION");
-    var ruby_arch: ?[]const u8 = std.posix.getenv("RUBY_ARCH");
+    var ruby_libdir: ?[]const u8 = try getEnvOwned(b.allocator,
+        "RUBY_LIBDIR");
+    var ruby_hdrdir: ?[]const u8 = try getEnvOwned(b.allocator,
+        "RUBY_HDRDIR");
+    var ruby_archhdrdir: ?[]const u8 = try getEnvOwned(b.allocator,
+        "RUBY_ARCHHDRDIR");
+    var ruby_version: ?[]const u8 = try getEnvOwned(b.allocator,
+        "RUBY_API_VERSION");
+    var ruby_arch: ?[]const u8 = try getEnvOwned(b.allocator,
+        "RUBY_ARCH");
 
     if (ruby_libdir == null or ruby_hdrdir == null or ruby_archhdrdir == null or ruby_version == null or ruby_arch == null) {
         const ruby_config_str: []u8 = try runRuby(
@@ -46,10 +57,12 @@ pub fn getConfig(b: *std.Build) !RubyConfig {
 }
 
 pub fn configureCompile(compile: *std.Build.Step.Compile, config: *const RubyConfig) void {
-    compile.linkLibC();
-    compile.addLibraryPath(.{ .cwd_relative = config.libdir });
-    compile.addSystemIncludePath(.{ .cwd_relative = config.hdrdir });
-    compile.addSystemIncludePath(.{ .cwd_relative = config.archhdrdir });
+    compile.root_module.link_libc = true;
+    compile.root_module.addLibraryPath(.{ .cwd_relative = config.libdir });
+    compile.root_module.addSystemIncludePath(.{ .cwd_relative =
+        config.hdrdir });
+    compile.root_module.addSystemIncludePath(.{ .cwd_relative =
+        config.archhdrdir });
 }
 
 pub const RubyExtensionOptions = struct {

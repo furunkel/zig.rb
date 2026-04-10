@@ -58,7 +58,8 @@ pub fn defineMethod(
     methods.validate(Data, zig_func);
     const arity = comptime methods.getArity(zig_func);
     const wrapper = methods.wrap(Data, zig_func, arity);
-    crb.rb_define_method(self.raw, name, @ptrCast(wrapper), @intCast(arity));
+    crb.rb_define_method(self.raw, name,
+        @ptrCast(@alignCast(wrapper)), @intCast(arity));
 }
 
 pub fn definePrivateMethod(
@@ -70,7 +71,8 @@ pub fn definePrivateMethod(
     methods.validate(Data, zig_func);
     const arity = comptime methods.getArity(zig_func);
     const wrapper = methods.wrap(Data, zig_func, arity);
-    crb.rb_define_private_method(self.raw, name, @ptrCast(wrapper), @intCast(arity));
+    crb.rb_define_private_method(self.raw, name,
+        @ptrCast(@alignCast(wrapper)), @intCast(arity));
 }
 
 pub fn defineProtectedMethod(
@@ -82,7 +84,8 @@ pub fn defineProtectedMethod(
     methods.validate(Data, zig_func);
     const arity = comptime methods.getArity(zig_func);
     const wrapper = methods.wrap(Data, zig_func, arity);
-    crb.rb_define_protected_method(self.raw, name, @ptrCast(wrapper), @intCast(arity));
+    crb.rb_define_protected_method(self.raw, name,
+        @ptrCast(@alignCast(wrapper)), @intCast(arity));
 }
 
 pub fn defineSingletonMethod(
@@ -93,7 +96,8 @@ pub fn defineSingletonMethod(
     methods.validate(null, zig_func);
     const arity = comptime methods.getArity(zig_func);
     const wrapper = methods.wrap(null, zig_func, arity);
-    crb.rb_define_singleton_method(self.raw, name, @ptrCast(wrapper), @intCast(arity));
+    crb.rb_define_singleton_method(self.raw, name,
+        @ptrCast(@alignCast(wrapper)), @intCast(arity));
 }
 
 pub fn defineMethods(
