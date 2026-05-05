@@ -7,7 +7,7 @@ const Module = rb.Module;
 export fn Init_example() void {
     rb.init();
     // Define a module called "Example"
-    const example_module = Module.define("Example");
+    const example_module = Module.define("Example", .{});
 
     // Define the add function on the Example module
     example_module.defineFunction(add, "add");
@@ -15,8 +15,9 @@ export fn Init_example() void {
 
 // Implementation of the add function
 // Takes two Ruby integers and returns their sum
-fn add(_: Value, a: Value, b: Value) Value {
+fn add(self: Value, a: Value, b: Value) Value {
     // Convert Ruby values to Zig integers, add them, and convert back
+    _ = self;
     const a_int = a.toInt(i64) catch 0;
     const b_int = b.toInt(i64) catch 0;
     const sum = a_int + b_int;

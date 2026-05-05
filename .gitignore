@@ -1,3 +1,6 @@
 zig-out/
 .zig-cache/
-git_scripts
+git_scripts/
+scripts/
+tmp/
+zig-pkg/

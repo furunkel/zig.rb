@@ -1,14 +1,29 @@
 const std = @import("std");
-const crb = @import("crb.zig").crb;
+const crb = @import("crb.zig");
 const Value = @import("Value.zig");
+const Error = @import("Error.zig");
+const typed_data = @import("typed_data.zig");
+
+fn getUnwrappedReturnType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .error_union => |eu| eu.payload,
+        else => T,
+    };
+}
+
+fn returnsErrorUnion(comptime T: type) bool {
+    return @typeInfo(T) == .error_union;
+}
 
 pub fn validate(comptime Data: ?type, comptime zig_func: anytype) void {
     const T = @TypeOf(zig_func);
 
     switch (@typeInfo(T)) {
         .@"fn" => |info| {
-            if (info.return_type.? != Value) {
-                @compileError("Method must return Value, got " ++ @typeName(info.return_type.?));
+            const return_type = info.return_type.?;
+            const unwrapped = getUnwrappedReturnType(return_type);
+            if (unwrapped != Value) {
+                @compileError("Method must return Value or !Value, got " ++ @typeName(return_type));
             }
 
             if (info.params.len < 1) {
@@ -61,6 +76,8 @@ pub fn wrap(
 
     const uses_data_ptr = Data != null and FirstParamType == *Data.?;
 
+    const returns_error = comptime returnsErrorUnion(func_info.return_type.?);
+
     const Wrapper = struct {
         inline fn callZigFunc(comptime n: usize, rb_self: crb.VALUE, rb_args: anytype) crb.VALUE {
             const call_arg_types = if (uses_data_ptr)
@@ -70,15 +87,20 @@ pub fn wrap(
 
             var call_args: call_arg_types = undefined;
             if (uses_data_ptr) {
-                call_args[0] = Data.?.ruby_type.unwrap(rb_self);
+                call_args[0] = typed_data.DataType(Data.?).get().unwrap(rb_self);
             } else {
                 call_args[0] = Value.fromRaw(rb_self);
             }
             inline for (0..n) |i| {
                 call_args[i + 1] = Value.fromRaw(rb_args[i]);
             }
-            const result = @call(.auto, zig_func, call_args);
-            return result.toRaw();
+            const raw_result = @call(.auto, zig_func, call_args);
+            // const ErrorType = if (returns_error) @typeInfo(func_info.return_type.?).error_union.error_set else void;
+            const result: Value = if (returns_error)
+                raw_result catch |err| Error.from(err).raise()
+            else
+                raw_result;
+            return result.asRaw();
         }
     };
 
@@ -165,4 +187,118 @@ pub fn wrap(
         }.wrapper),
         else => @compileError("Arity " ++ std.fmt.comptimePrint("{d}", .{arity}) ++ " not supported. Maximum arity is 15."),
     };
+}
+
+pub fn defineMethod(
+    cls: Value,
+    comptime name: [:0]const u8,
+    comptime Data: ?type,
+    comptime zig_func: anytype,
+) void {
+    validate(Data, zig_func);
+    const arity = comptime getArity(zig_func);
+    const wrapper = wrap(Data, zig_func, arity);
+    crb.rb_define_method(cls.asRaw(), name, @ptrCast(wrapper), @intCast(arity));
+}
+
+pub fn definePrivateMethod(
+    cls: Value,
+    comptime name: [:0]const u8,
+    comptime Data: ?type,
+    comptime zig_func: anytype,
+) void {
+    validate(Data, zig_func);
+    const arity = comptime getArity(zig_func);
+    const wrapper = wrap(Data, zig_func, arity);
+    crb.rb_define_private_method(cls.asRaw(), name, @ptrCast(wrapper), @intCast(arity));
+}
+
+pub fn defineProtectedMethod(
+    cls: Value,
+    comptime name: [:0]const u8,
+    comptime Data: ?type,
+    comptime zig_func: anytype,
+) void {
+    validate(Data, zig_func);
+    const arity = comptime getArity(zig_func);
+    const wrapper = wrap(Data, zig_func, arity);
+    crb.rb_define_protected_method(cls.asRaw(), name, @ptrCast(wrapper), @intCast(arity));
+}
+
+pub fn defineSingletonMethod(
+    cls: Value,
+    comptime name: [:0]const u8,
+    comptime zig_func: anytype,
+) void {
+    validate(null, zig_func);
+    const arity = comptime getArity(zig_func);
+    const wrapper = wrap(null, zig_func, arity);
+    crb.rb_define_singleton_method(cls.asRaw(), name, @ptrCast(wrapper), @intCast(arity));
+}
+
+pub fn defineMethods(
+    cls: Value,
+    comptime Data: ?type,
+    comptime Methods: type,
+) void {
+    switch (@typeInfo(Methods)) {
+        .@"struct" => |info| {
+            inline for (info.decls) |decl| {
+                const method_name = decl.name;
+                const func = @field(Methods, method_name);
+                defineMethod(cls, method_name, Data, func);
+            }
+        },
+        else => @compileError("Methods must be a struct, got " ++ @typeName(Methods)),
+    }
+}
+
+pub fn definePrivateMethods(
+    cls: Value,
+    comptime Data: ?type,
+    comptime Methods: type,
+) void {
+    switch (@typeInfo(Methods)) {
+        .@"struct" => |info| {
+            inline for (info.decls) |decl| {
+                const method_name = decl.name;
+                const func = @field(Methods, method_name);
+                definePrivateMethod(cls, Data, func, method_name);
+            }
+        },
+        else => @compileError("Methods must be a struct, got " ++ @typeName(Methods)),
+    }
+}
+
+pub fn defineProtectedMethods(
+    cls: Value,
+    comptime Data: type,
+    comptime Methods: type,
+) void {
+    switch (@typeInfo(Methods)) {
+        .@"struct" => |info| {
+            inline for (info.decls) |decl| {
+                const method_name = decl.name;
+                const func = @field(Methods, method_name);
+                defineProtectedMethod(cls, Data, func, method_name);
+            }
+        },
+        else => @compileError("Methods must be a struct, got " ++ @typeName(Methods)),
+    }
+}
+
+pub fn defineSingletonMethods(
+    cls: Value,
+    comptime Methods: type,
+) void {
+    switch (@typeInfo(Methods)) {
+        .@"struct" => |info| {
+            inline for (info.decls) |decl| {
+                const method_name = decl.name;
+                const func = @field(Methods, method_name);
+                defineSingletonMethod(cls, method_name, func);
+            }
+        },
+        else => @compileError("Methods must be a struct, got " ++ @typeName(Methods)),
+    }
 }

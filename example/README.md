@@ -73,7 +73,8 @@ puts result  # => 30
 The extension defines a single module `Example` with one function `add`:
 
 ```zig
-fn add(_: Value, a: Value, b: Value) Value {
+fn add(self: Value, a: Value, b: Value) Value {
+    _ = self;
     const a_int = a.toInt(i64) catch 0;
     const b_int = b.toInt(i64) catch 0;
     const sum = a_int + b_int;

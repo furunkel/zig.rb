@@ -1,7 +1,11 @@
 const std = @import("std");
-const crb = @import("crb.zig").crb;
+const crb = @import("crb.zig");
 const Self = @This();
 const Allocator = std.mem.Allocator;
+
+pub fn default() Self {
+    return .{};
+}
 
 pub fn allocator(self: *const Self) Allocator {
     return .{

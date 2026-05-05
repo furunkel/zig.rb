@@ -30,6 +30,11 @@ class TestZigRbExtension < Minitest::Test
     assert_equal '0.1.0', ZigRbTest::VERSION
   end
 
+  def test_define_outer_for_module
+    assert_equal ZigRbTest::OuterMod, ZigRbTest.const_get(:OuterMod)
+    assert_equal ZigRbTest::OuterMod::InnerMod, ZigRbTest::OuterMod.const_get(:InnerMod)
+  end
+
   def test_add
     assert_equal 5, ZigRbTest.add(2, 3)
     assert_equal 0, ZigRbTest.add(-5, 5)
@@ -275,5 +280,76 @@ class TestTypeTester < Minitest::Test
     assert_equal 'symbol', tt.get_type(:test)
     assert_equal 'true', tt.get_type(true)
     assert_equal 'false', tt.get_type(false)
+  end
+end
+
+class TestErrorTester < Minitest::Test
+  def test_zig_error_class_exists
+    assert defined?(ZigError), "ZigError class should be defined"
+    assert ZigError < StandardError, "ZigError should inherit from StandardError"
+  end
+
+  def test_test_error_class_exists
+    assert defined?(TestError), "TestError class should be defined"
+    assert TestError < StandardError, "TestError should inherit from StandardError"
+  end
+
+  def test_may_fail_success
+    et = ErrorTester.new
+    assert_equal 20, et.may_fail(10)
+    assert_equal 0, et.may_fail(0)
+    assert_equal 200, et.may_fail(100)
+  end
+
+  def test_may_fail_invalid_input
+    et = ErrorTester.new
+    err = assert_raises(TestError) { et.may_fail(-1) }
+    assert_match(/InvalidInput/, err.message)
+  end
+
+  def test_may_fail_out_of_range
+    et = ErrorTester.new
+    err = assert_raises(TestError) { et.may_fail(101) }
+    assert_match(/OutOfRange/, err.message)
+  end
+
+  def test_always_succeeds
+    et = ErrorTester.new
+    assert_equal 43, et.always_succeeds(42)
+    assert_equal 1, et.always_succeeds(0)
+  end
+
+  def test_always_fails
+    et = ErrorTester.new
+    err = assert_raises(TestError) { et.always_fails(0) }
+    assert_match(/NotFound/, err.message)
+  end
+
+  def test_fallback_to_zig_error_with_anyerror
+    et = ErrorTester.new
+    err = assert_raises(ZigError) { et.fails_with_anyerror(0) }
+    assert_match(/InvalidInput/, err.message)
+    assert_equal :InvalidInput, err.value
+    assert_match(/anyerror/, err.type)
+  end
+
+  def test_fallback_to_zig_error_with_unregistered
+    et = ErrorTester.new
+    err = assert_raises(ZigError) { et.fails_with_unregistered(0) }
+    assert_match(/SomeError/, err.message)
+    assert_equal :SomeError, err.value
+    assert_match(/SomeError/, err.type)
+  end
+
+  def test_explicit_raise_success
+    et = ErrorTester.new
+    assert_equal 42, et.explicit_raise(42)
+    assert_equal 0, et.explicit_raise(0)
+  end
+
+  def test_explicit_raise_with_formatted_message
+    et = ErrorTester.new
+    err = assert_raises(TestError) { et.explicit_raise(-5) }
+    assert_match(/Value must be non-negative, got -5/, err.message)
   end
 end

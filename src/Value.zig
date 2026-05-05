@@ -1,7 +1,16 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const crb = @import("crb.zig").crb;
+const crb = @import("crb.zig");
 const ids = @import("ids.zig");
+const Error = @import("Error.zig");
+const RubyError = Error.RubyError;
+const Class = @import("Class.zig");
+const Fixnum = @import("Fixnum.zig");
+const Float = @import("Float.zig");
+const Bignum = @import("Bignum.zig");
+const String = @import("String.zig");
+const Array = @import("Array.zig");
+const Integer = @import("integer.zig").Integer;
+const Symbol = @import("Symbol.zig");
 const Self = @This();
 
 raw: crb.VALUE,
@@ -10,9 +19,14 @@ pub const nil = Self{ .raw = crb.Qnil };
 pub const @"true" = Self{ .raw = crb.Qtrue };
 pub const @"false" = Self{ .raw = crb.Qfalse };
 
+pub fn objectClass() Self {
+    return .{ .raw = crb.rb_cObject };
+}
+
 pub const ConversionError = error{
     UnsupportedConversion,
     TypeError,
+    RubyError,
 };
 
 pub const Type = enum(c_int) {
@@ -38,178 +52,277 @@ pub const Type = enum(c_int) {
     symbol = crb.RUBY_T_SYMBOL,
     fixnum = crb.RUBY_T_FIXNUM,
     undef = crb.RUBY_T_UNDEF,
+
+    pub fn isNumeric(self: Type) bool {
+        return self == .float or self == .fixnum or self == .bignum;
+    }
+
+    pub fn isInteger(self: Type) bool {
+        return self == .fixnum or self == .bignum;
+    }
 };
 
 pub fn fromRaw(raw: crb.VALUE) Self {
     return .{ .raw = raw };
 }
 
-pub fn toRaw(self: Self) crb.VALUE {
+pub fn asRaw(self: Self) crb.VALUE {
     return self.raw;
 }
 
-pub fn from(value: anytype) Self {
-    if (@TypeOf(value) == Self) {
-        return value;
-    }
-    return .{ .raw = toRuby(value) };
-}
-
 pub fn isEql(self: Self, other: Self) bool {
-    return crb.rb_eql(self.toRaw(), other.toRaw()) != 0;
+    return crb.rb_eql(self.asRaw(), other.asRaw()) != 0;
 }
 
-pub fn isEqual(self: Self, other: Self) bool {
-    return crb.rb_equal(self.toRaw(), other.toRaw()) != 0;
+pub fn asFixnum(self: Self) ConversionError!Fixnum {
+    if (self.getType() == .fixnum) {
+        return Fixnum.fromValueUnchecked(self);
+    } else {
+        return ConversionError.TypeError;
+    }
+}
+
+pub fn asBignum(self: Self) ConversionError!Bignum {
+    if (self.getType() == .bignum) {
+        return Bignum.fromValueUnchecked(self);
+    } else {
+        return ConversionError.TypeError;
+    }
+}
+
+pub fn asInteger(self: Self) ConversionError!Integer {
+    return switch (self.getType()) {
+        .fixnum => .{ .fixnum = try self.asFixnum() },
+        .bignum => .{ .bignum = try self.asBignum() },
+        else => ConversionError.TypeError,
+    };
+}
+
+pub fn asString(self: Self) ConversionError!String {
+    if (self.getType() == .string) {
+        return String.fromValueUnchecked(self);
+    } else {
+        return ConversionError.TypeError;
+    }
+}
+
+pub fn asFloat(self: Self) ConversionError!Float {
+    if (self.getType() == .float) {
+        return Float.fromValueUnchecked(self);
+    } else {
+        return ConversionError.TypeError;
+    }
+}
+
+pub fn asSymbol(self: Self) ConversionError!Symbol {
+    if (self.getType() == .symbol) {
+        return Symbol.fromValueUnchecked(self);
+    } else {
+        return ConversionError.TypeError;
+    }
+}
+
+pub fn freeze(self: Self) void {
+    _ = crb.rb_obj_freeze(self.asRaw());
+}
+
+pub fn isType(self: Self, @"type": Type) bool {
+    crb.rb_type_p(self.raw, @intFromEnum(@"type"));
+}
+
+pub fn isEqualUnprotected(self: Self, other: Self) bool {
+    return crb.rb_equal(self.asRaw(), other.asRaw()) != 0;
+}
+
+pub fn isEqual(self: Self, other: Self) RubyError!bool {
+    const Args = struct { self: Self, other: Self };
+    const args = Args{ .self = self, .other = other };
+    return Error.protect(args, bool, struct {
+        pub fn call(p: *const Args) bool {
+            return p.self.isEqualUnprotected(p.other);
+        }
+    }.call);
 }
 
 pub fn isIdentical(self: Self, other: Self) bool {
-    return self.toRaw() == other.toRaw();
-}
-
-pub fn newString(str: []const u8) Self {
-    return .{ .raw = crb.rb_str_new(str.ptr, @intCast(str.len)) };
-}
-
-pub fn newInt(comptime T: type, value: T) Self {
-    return .{ .raw = intToRuby(T, value) };
-}
-
-pub fn newFloat(value: f64) Self {
-    return .{ .raw = crb.rb_float_new(value) };
+    return self.asRaw() == other.asRaw();
 }
 
 pub fn fromBool(value: bool) Self {
     return .{ .raw = if (value) crb.Qtrue else crb.Qfalse };
 }
 
-fn packFlags() c_int {
-    return switch (builtin.cpu.arch.endian()) {
-        .little => crb.INTEGER_PACK_2COMP | crb.INTEGER_PACK_LITTLE_ENDIAN,
-        .big => crb.INTEGER_PACK_2COMP | crb.INTEGER_PACK_BIG_ENDIAN,
-    };
-}
-
-fn packBufferBits(val: crb.VALUE) !usize {
-    var size: usize = undefined;
-    const neg = if (crb.FIXNUM_P(val)) crb.FIX2LONG(val) < 0 else crb.RBIGNUM_NEGATIVE_P(val);
-    var nlz_bits: c_int = undefined;
-    size = crb.rb_absint_numwords(val, 1, @ptrCast(@alignCast(&nlz_bits)));
-    if (nlz_bits == 0 and !(neg and crb.rb_absint_singlebit_p(val) != 0))
-        size += 1;
-    return size;
-}
-
-pub fn fromBigInt(value: anytype, allocator: std.mem.Allocator) !Self {
-    var value_const: std.math.big.int.Const = undefined;
-    var value_managed: ?std.math.big.int.Managed = null;
-    defer {
-        if (value_managed) |*m| {
-            m.deinit();
-        }
-    }
-
-    const T = @TypeOf(value);
-
-    switch (@typeInfo(T)) {
-        .int, .comptime_int => {
-            const value_managed_ = try std.math.big.int.Managed.initSet(allocator, value);
-            value_const = value_managed_.toConst();
-            value_managed = value_managed_;
-        },
-        .@"struct" => {
-            if (T == std.math.big.int.Const) {
-                value_const = value;
-            } else if (T == std.math.big.int.Managed) {
-                // don't set value_managed, as this one is not owned by us
-                value_const = value.toConst();
-            }
-        },
-        else => @compileError("Unsupported type for BigInt conversion"),
-    }
-
-    if (value_const.eqlZero()) {
-        return .{ .raw = crb.INT2NUM(0) };
-    }
-
-    const bit_count = value_const.bitCountTwosCompForSignedness(.signed);
-
-    const num_bytes = try std.math.divCeil(usize, bit_count, @bitSizeOf(u8));
-    const byte_aligned_bit_count = num_bytes * 8;
-
-    const buf_bytes = try allocator.alloc(u8, num_bytes);
-    defer allocator.free(buf_bytes);
-    @memset(buf_bytes, 0);
-
-    value_const.writePackedTwosComplement(buf_bytes, 0, byte_aligned_bit_count, builtin.cpu.arch.endian());
-
-    const rb_packed = crb.rb_integer_unpack(@ptrCast(@alignCast(@constCast(buf_bytes.ptr))), @intCast(num_bytes), @sizeOf(u8), 0, packFlags());
-
-    return .{ .raw = rb_packed };
-}
-
-pub fn toBigInt(self: Self, allocator: std.mem.Allocator) !std.math.big.int.Managed {
-    switch (self.getType()) {
-        .fixnum => {
-            const val = crb.NUM2LONG(self.raw);
-            var result = try std.math.big.int.Managed.init(allocator);
-            errdefer result.deinit();
-            try result.set(val);
-            return result;
-        },
-        .bignum => {
-            const num_bits = try packBufferBits(self.raw);
-
-            const num_bytes = try std.math.divCeil(usize, @intCast(num_bits), @bitSizeOf(u8));
-            const buf = try allocator.alloc(u8, num_bytes);
-            defer allocator.free(buf);
-            @memset(buf, 0);
-
-            _ = crb.rb_integer_pack(self.raw, buf.ptr, @intCast(num_bytes), @sizeOf(u8), 0, packFlags());
-
-            var result = try std.math.big.int.Managed.init(allocator);
-            errdefer result.deinit();
-
-            const bytes = buf;
-
-            // Ensure we have enough capacity for the limbs
-            const Limb = std.math.big.Limb;
-            const read_bit_count = num_bytes * 8;
-            const num_limbs = (read_bit_count + @bitSizeOf(Limb) - 1) / @bitSizeOf(Limb);
-            try result.ensureCapacity(num_limbs);
-
-            var mutable = result.toMutable();
-
-            // read full bytes
-            mutable.readPackedTwosComplement(bytes, 0, read_bit_count, builtin.cpu.arch.endian(), .signed);
-
-            // Update the Managed's metadata with the values from mutable
-            result.setMetadata(mutable.positive, mutable.len);
-
-            return result;
-        },
-        else => return ConversionError.TypeError,
-    }
-}
-
 pub fn to(self: Self, comptime T: type) ConversionError!T {
-    return fromRuby(T, self.raw);
+    switch (@typeInfo(T)) {
+        .int => return switch (self.getType()) {
+            .fixnum => @intCast(Fixnum.fromValueUnchecked(self).toInt()),
+            .bignum => ConversionError.UnsupportedConversion,
+            else => ConversionError.TypeError,
+        },
+        .bool => return toBool(self),
+        .float => return toFloatValue(T, self),
+        else => {
+            // Handle special types
+            if (T == []const u8) {
+                return (try String.fromValue(self)).toSlice();
+            }
+            return ConversionError.UnsupportedConversion;
+        },
+    }
 }
 
-pub fn toInt(self: Self, comptime T: type) ConversionError!T {
-    return fromRuby(T, self.raw);
+pub fn allocTo(self: Self, allocator: std.mem.Allocator, comptime T: type) ConversionError!T {
+    switch (@typeInfo(T)) {
+        .int => return switch (crb.rb_type(self.raw)) {
+            crb.RUBY_T_FIXNUM => @intCast(Fixnum.fromValueUnchecked(self).toInt()),
+            crb.RUBY_T_BIGNUM => blk: {
+                const managed = Bignum.fromRawUnchecked(self.raw).toManaged(allocator) catch {
+                    return ConversionError.UnsupportedConversion;
+                };
+                defer managed.deinit();
+
+                const info = @typeInfo(T).int;
+                const bits = info.bits;
+                const signed = info.signedness == .signed;
+
+                if (managed.bitCountTwosCompForSignedness(if (signed) .signed else .unsigned) > bits) {
+                    return ConversionError.Overflow;
+                }
+
+                break :blk managed.toInt(T) catch ConversionError.Overflow;
+            },
+            else => ConversionError.TypeError,
+        },
+        .bool => return toBool(self.raw),
+        .float => return toFloatValue(T, self.raw),
+        else => {
+            if (T == []const u8) {
+                return (try String.fromValue(self)).toSlice();
+            }
+            if (T == std.math.big.int.Managed) {
+                return switch (crb.rb_type(self.raw)) {
+                    crb.RUBY_T_FIXNUM => Fixnum.fromValueUnchecked(self).toManaged(allocator) catch {
+                        return ConversionError.OutOfMemory;
+                    },
+                    crb.RUBY_T_BIGNUM => Bignum.fromValueUnchecked(self).toManaged(allocator) catch {
+                        return ConversionError.OutOfMemory;
+                    },
+                    else => return ConversionError.TypeError,
+                };
+            }
+            return ConversionError.UnsupportedConversion;
+        },
+    }
 }
 
-pub fn toFloat(self: Self, comptime T: type) ConversionError!T {
-    return fromRuby(T, self.raw);
+pub fn toSlice(self: Self) ConversionError![]const u8 {
+    return (try self.asString()).toSlice();
 }
 
-pub fn toBool(self: Self) ConversionError!bool {
-    return fromRuby(bool, self.raw);
+pub fn stringValueCStr(self: Self) ![:0]const u8 {
+    const str = crb.rb_string_value(@ptrCast(@constCast(&self.raw)));
+    const len = crb.RSTRING_LEN(str);
+    const ptr = crb.RSTRING_PTR(str);
+
+    std.debug.assert(ptr[@as(usize, @intCast(len))] == 0);
+    const slice = ptr[0..@intCast(len) :0];
+    if (std.mem.indexOfScalar(u8, slice, 0) != null) {
+        return error.ContainsNullByte;
+    }
+    return slice;
 }
 
-pub fn toString(self: Self) ConversionError![]const u8 {
-    return fromRuby([]const u8, self.raw);
+pub fn toStr(self: Self) ConversionError!String {
+    const str_value = Self.fromRaw(crb.rb_check_string_type(self.raw));
+    if (str_value.raw == crb.Qnil) {
+        return ConversionError.TypeError;
+    }
+    return String.fromValueUnchecked(str_value);
+}
+
+pub fn toSUnprotected(self: Self) Self {
+    return Self.fromRaw(crb.rb_funcall(self.raw, ids.to_s, 0));
+}
+
+pub fn toS(self: Self) RubyError!String {
+    const str_value = try Error.protect(self, Self, struct {
+        pub fn call(p: *const Self) Self {
+            return p.toSUnprotected();
+        }
+    }.call);
+    return String.fromValueUnchecked(str_value);
+}
+
+pub fn toAUnprotected(self: Self) Self {
+    return Self.fromRaw(crb.rb_funcall(self.raw, ids.to_a, 0));
+}
+
+pub fn toA(self: Self) RubyError!Array {
+    const arr_value = try Error.protect(self, Self, struct {
+        pub fn call(p: *const Self) Self {
+            return p.toAUnprotected();
+        }
+    }.call);
+    return Array.fromValue(arr_value);
+}
+
+pub fn toFlt(self: Self) ConversionError!Float {
+    const float_value = Self.fromRaw(crb.rb_check_to_float(self.raw));
+    if (float_value.raw == crb.Qnil) {
+        return ConversionError.TypeError;
+    }
+    return Float.fromValueUnchecked(float_value);
+}
+
+pub fn toFUnprotected(self: Self) Self {
+    return Self.fromRaw(crb.rb_funcall(self.raw, ids.to_f, 0));
+}
+
+pub fn toF(self: Self) RubyError!Float {
+    const float_value = try Error.protect(self, Self, struct {
+        pub fn call(p: *const Self) Self {
+            return p.toFUnprotected();
+        }
+    }.call);
+    if (!float_value.getType().isNumeric()) return error.TypeError;
+    return Float.fromValueUnchecked(float_value);
+}
+
+pub fn toInt(self: Self) ConversionError!Integer {
+    const int_value = Self.fromRaw(crb.rb_check_to_int(self.raw));
+    if (int_value.raw == crb.Qnil) {
+        return ConversionError.TypeError;
+    }
+    return int_value.asInteger();
+}
+
+pub fn toAry(self: Self) ConversionError!Array {
+    const arr_value = Self.fromRaw(crb.rb_check_array_type(self.raw));
+    if (arr_value.raw == crb.Qnil) {
+        return ConversionError.TypeError;
+    }
+    return Array.fromValue(arr_value);
+}
+
+pub fn toIUnprotected(self: Self) Self {
+    return Self.fromRaw(crb.rb_funcall(self.raw, ids.to_i, 0));
+}
+
+pub fn toI(self: Self) RubyError!Integer {
+    if (self.getType().isInteger()) {
+        return self.asInteger() catch unreachable;
+    }
+    const int_value = try Error.protect(self, Self, struct {
+        pub fn call(p: *const Self) Self {
+            return p.toIUnprotected();
+        }
+    }.call);
+    if (!int_value.getType().isInteger()) return error.TypeError;
+    return int_value.asInteger() catch unreachable;
+}
+
+pub fn isKindOf(self: Self, class: Class) bool {
+    return crb.rb_obj_is_kind_of(self.raw, class.asValue().asRaw()) != 0;
 }
 
 pub fn isNil(self: Self) bool {
@@ -224,12 +337,12 @@ pub fn isFalse(self: Self) bool {
     return self.raw == crb.Qfalse;
 }
 
-pub fn isTruthy(self: Self) bool {
-    return self.raw != crb.Qnil and self.raw != crb.Qfalse;
-}
-
 pub fn isFalsy(self: Self) bool {
     return self.raw == crb.Qnil or self.raw == crb.Qfalse;
+}
+
+pub fn isTruthy(self: Self) bool {
+    return !self.isFalsy();
 }
 
 pub fn getType(self: Self) Type {
@@ -240,178 +353,153 @@ pub fn getTypeRaw(self: Self) c_int {
     return crb.rb_type(self.raw);
 }
 
-pub fn symbol(str: []const u8) Self {
-    return .{ .raw = crb.ID2SYM(crb.rb_intern2(str.ptr, @intCast(str.len))) };
-}
-
-pub fn order(self: Self, other: Self) std.math.Order {
+pub fn orderUnprotected(self: Self, other: Self) std.math.Order {
     const cmp_result = crb.rb_cmpint(crb.rb_funcall(self.raw, ids.@"<=>", 1, other.raw), self.raw, other.raw);
-    if (cmp_result < 0) {
-        return .lt;
-    } else if (cmp_result > 0) {
-        return .gt;
-    } else {
-        return .eq;
-    }
+    return if (cmp_result < 0) .lt else if (cmp_result > 0) .gt else .eq;
 }
 
-fn toRuby(value: anytype) crb.VALUE {
+pub fn order(self: Self, other: Self) RubyError!std.math.Order {
+    const Args = struct { self: Self, other: Self };
+    const args = Args{ .self = self, .other = other };
+    return Error.protect(args, std.math.Order, struct {
+        pub fn call(p: *const Args) std.math.Order {
+            return p.self.orderUnprotected(p.other);
+        }
+    }.call);
+}
+
+pub fn from(value: anytype) Self {
     const T = @TypeOf(value);
+    if (T == Self) return value;
+
+    return switch (@typeInfo(T)) {
+        .int => blk: {
+            if (value >= Fixnum.min_fixnum and value <= Fixnum.max_fixnum) {
+                break :blk Fixnum.fromInt(@intCast(value)).asValue();
+            }
+            @compileError("Integer value outside fixnum range, use allocFrom() for bignums");
+        },
+        .comptime_int => blk: {
+            if (value >= Fixnum.min_fixnum and value <= Fixnum.max_fixnum) {
+                break :blk Fixnum.fromComptime(value).asValue();
+            }
+            @compileError("Integer value outside fixnum range, use allocFrom() for bignums");
+        },
+        .float => Float.from(value).asValue(),
+        .comptime_float => Float.fromComptime(value).asValue(),
+        .bool => fromBool(value),
+        .pointer => |ptr_info| switch (ptr_info.size) {
+            .one => blk: {
+                if (@typeInfo(ptr_info.child) == .array) {
+                    const array_info = @typeInfo(ptr_info.child).array;
+                    if (array_info.child == u8) {
+                        const str: [*:0]const u8 = @ptrCast(value);
+                        break :blk fromRaw(crb.rb_str_new_cstr(str));
+                    }
+                    @compileError("Array type needs allocation, use allocFrom()");
+                }
+                @compileError("Pointer type '" ++ @typeName(T) ++ "' not supported");
+            },
+            .slice => blk: {
+                if (ptr_info.child == u8) {
+                    break :blk String.from(value).asValue();
+                }
+                @compileError("Slice type needs allocation, use allocFrom()");
+            },
+            else => @compileError("Pointer type '" ++ @typeName(T) ++ "' not supported"),
+        },
+        else => @compileError("Type '" ++ @typeName(T) ++ "' not supported by from()"),
+    };
+}
+
+pub fn allocFrom(allocator: std.mem.Allocator, value: anytype) !Self {
+    const T = @TypeOf(value);
+    if (T == Self) return value;
 
     switch (@typeInfo(T)) {
-        .int => return intToRuby(T, value),
-        .comptime_int => return comptimeIntToRuby(value),
-        .float, .comptime_float => return crb.rb_float_new(value),
-        .bool => return if (value) crb.Qtrue else crb.Qfalse,
-        .pointer => |ptr_info| {
-            switch (ptr_info.size) {
-                .one => {
-                    // Handle pointer to array (string literals)
-                    if (@typeInfo(ptr_info.child) == .array) {
-                        const array_info = @typeInfo(ptr_info.child).array;
-                        if (array_info.child == u8) {
-                            // This is a string literal like "*const [N:0]u8"
-                            const str: [*:0]const u8 = @ptrCast(value);
-                            return crb.rb_str_new_cstr(str);
-                        }
-                    }
-                },
-                .slice => {
-                    // Handle string slices
-                    if (ptr_info.child == u8) {
-                        const str: []const u8 = value;
-                        return crb.rb_str_new(str.ptr, @intCast(str.len));
-                    }
-                },
-                else => {},
+        .int => {
+            if (value >= Fixnum.min_fixnum and value <= Fixnum.max_fixnum) {
+                return Fixnum.fromInt(@intCast(value)).asValue();
             }
-            @compileError("don't know how to convert pointer type '" ++ @typeName(T) ++ "' to Ruby");
+            return (try Bignum.fromType(T, value)).asValue();
         },
-        else => @compileError("don't know how to convert type '" ++ @typeName(T) ++ "' to Ruby"),
-    }
-}
-
-fn intToRuby(comptime T: type, value: T) crb.VALUE {
-    const info = @typeInfo(T).int;
-    const int_bits = @typeInfo(c_int).int.bits;
-    const uint_bits = @typeInfo(c_uint).int.bits;
-    const long_bits = @typeInfo(c_long).int.bits;
-    const ulong_bits = @typeInfo(c_ulong).int.bits;
-
-    // Small integers fit in c_int
-    if (info.bits < int_bits) {
-        return crb.RB_INT2FIX(@as(c_int, value));
-    }
-
-    // Match by signedness and size
-    if (info.signedness == .signed) {
-        if (info.bits <= int_bits) {
-            return crb.RB_INT2FIX(value);
-        } else if (info.bits <= long_bits) {
-            return crb.RB_LONG2NUM(value);
-        }
-    } else {
-        if (info.bits <= uint_bits) {
-            return crb.RB_UINT2NUM(value);
-        } else if (info.bits <= ulong_bits) {
-            return crb.RB_ULONG2NUM(value);
-        }
-    }
-
-    @compileError("cannot convert integer type '" ++ @typeName(T) ++ "' to Ruby");
-}
-
-fn comptimeIntToRuby(comptime value: comptime_int) crb.VALUE {
-    const long_bits = @typeInfo(c_long).int.bits;
-    // See https://github.com/ruby/ruby/blob/97c133a8591495156f46b53c613abee8c7088a04/spec/mspec/lib/mspec/helpers/numeric.rb#L46
-    const max_fixnum = (2 << (long_bits - 3)) - 1;
-    const min_fixnum = -(2 << (long_bits - 3));
-
-    if (comptime value >= min_fixnum and value <= max_fixnum) {
-        return crb.RB_INT2FIX(value);
-    } else {
-        return crb.RB_LONG2NUM(value);
-    }
-}
-
-fn fromRuby(comptime T: type, rb_value: crb.VALUE) ConversionError!T {
-    switch (@typeInfo(T)) {
-        .int => return intFromRuby(T, rb_value),
-        .bool => return boolFromRuby(rb_value),
-        else => {
-            // Handle special types
-            if (T == []const u8) {
-                return stringFromRuby(rb_value);
-            } else if (T == f64) {
-                return floatFromRuby(rb_value);
+        .comptime_int => {
+            if (value >= Fixnum.min_fixnum and value <= Fixnum.max_fixnum) {
+                return Fixnum.fromComptime(value).asValue();
             }
-            return ConversionError.UnsupportedConversion;
+            return (try Bignum.from(@as(i200, value))).asValue();
         },
+        .float, .comptime_float, .bool => return from(value),
+        .pointer => |ptr_info| switch (ptr_info.size) {
+            .one => {
+                if (@typeInfo(ptr_info.child) == .array) {
+                    const array_info = @typeInfo(ptr_info.child).array;
+                    if (array_info.child == u8) {
+                        return from(value);
+                    }
+                    const slice: []const array_info.child = value[0..array_info.len];
+                    return (try Array.fromSlice(allocator, array_info.child, slice)).asValue();
+                }
+                @compileError("Pointer type '" ++ @typeName(T) ++ "' not supported");
+            },
+            .slice => {
+                if (ptr_info.child == u8) {
+                    return from(value);
+                }
+                return (try Array.fromSlice(allocator, ptr_info.child, value)).asValue();
+            },
+            else => @compileError("Pointer type '" ++ @typeName(T) ++ "' not supported"),
+        },
+        else => @compileError("Type '" ++ @typeName(T) ++ "' not supported by allocFrom()"),
     }
 }
 
-fn intFromRuby(comptime T: type, rb_value: crb.VALUE) ConversionError!T {
-    const rb_type = crb.rb_type(rb_value);
-    if (rb_type != crb.RUBY_T_FIXNUM and rb_type != crb.RUBY_T_BIGNUM) {
-        return ConversionError.TypeError;
-    }
-
-    const info = @typeInfo(T).int;
-
-    if (info.signedness == .signed) {
-        const raw: c_longlong = crb.rb_num2ll(rb_value);
-        const casted = std.math.cast(T, raw) orelse return ConversionError.UnsupportedConversion;
-        return casted;
-    } else {
-        const raw: c_ulonglong = crb.rb_num2ull(rb_value);
-        const casted = std.math.cast(T, raw) orelse return ConversionError.UnsupportedConversion;
-        return casted;
-    }
-}
-
-fn floatFromRuby(rb_value: crb.VALUE) ConversionError!f64 {
-    const rb_type = crb.rb_type(rb_value);
-
-    switch (rb_type) {
-        crb.RUBY_T_FLOAT => return crb.rb_num2dbl(rb_value),
-        crb.RUBY_T_FIXNUM, crb.RUBY_T_BIGNUM => return crb.rb_num2dbl(rb_value),
+fn toFloatValue(T: type, value: Self) ConversionError!T {
+    switch (value.getType()) {
+        .float => return Float.fromValueUnchecked(value).to(T),
+        .fixnum, .bignum => return std.math.lossyCast(T, crb.rb_num2dbl(value.asRaw())),
         else => return ConversionError.TypeError,
     }
 }
 
-fn boolFromRuby(rb_value: crb.VALUE) ConversionError!bool {
-    const rb_type = crb.rb_type(rb_value);
-
-    return switch (rb_type) {
-        crb.RUBY_T_FALSE => false,
-        crb.RUBY_T_TRUE => true,
+fn toBool(value: Self) ConversionError!bool {
+    return switch (value.getType()) {
+        .false => false,
+        .true => true,
         else => ConversionError.TypeError,
     };
 }
 
-fn stringFromRuby(rb_value: crb.VALUE) ConversionError![]const u8 {
-    const rb_type = crb.rb_type(rb_value);
-
-    if (rb_type != crb.RUBY_T_STRING) {
-        return ConversionError.TypeError;
-    }
-
-    const ptr = crb.RSTRING_PTR(rb_value);
-    const len = crb.RSTRING_LEN(rb_value);
-    return ptr[0..@intCast(len)];
+pub fn instanceVariableSetUnprotected(self: Self, name: []const u8, value: Self) void {
+    _ = crb.rb_ivar_set(self.raw, crb.rb_intern2(name.ptr, @as(c_long, @intCast(name.len))), value.asRaw());
 }
 
+pub fn instanceVariableSet(self: Self, name: []const u8, value: Self) RubyError!void {
+    const Args = struct { self: Self, name: []const u8, value: Self };
+    const args = Args{ .self = self, .name = name, .value = value };
+    return Error.protect(args, void, struct {
+        pub fn call(p: *const Args) void {
+            p.self.instanceVariableSetUnprotected(p.name, p.value);
+        }
+    }.call);
+}
+
+pub fn instanceVariableGet(self: Self, name: []const u8) Self {
+    return Self.fromRaw(crb.rb_ivar_get(self.raw, crb.rb_intern2(name.ptr, name.len)));
+}
+
+// FIXME: add Value.inspect and use here
 pub fn format(
     self: Self,
     writer: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
-    // Call Ruby's inspect method to get a string representation
-    const inspect_result = crb.rb_funcall(self.raw, crb.rb_intern("inspect"), 0);
-    const inspect_str = stringFromRuby(inspect_result) catch {
-        // Fallback if inspect fails
+    // call ruby's inspect method to get a string representation
+    const inspect_result = crb.rb_funcall(self.raw, ids.inspect, 0);
+    const inspect_str = (String.fromValue(Self.fromRaw(inspect_result)) catch {
+        // fallback
         try writer.print("Value{{raw=0x{x}}}", .{self.raw});
         return;
-    };
+    }).toSlice();
 
     try writer.writeAll(inspect_str);
 }
@@ -422,10 +510,10 @@ test "format" {
     const allocator = testing.allocator;
 
     {
-        var allocating = std.io.Writer.Allocating.init(allocator);
+        var allocating = std.Io.Writer.Allocating.init(allocator);
         defer allocating.deinit();
 
-        const int_value = Self.from(42);
+        const int_value = Fixnum.fromComptime(42).asValue();
         try int_value.format(&allocating.writer);
 
         const int_output = try allocating.toOwnedSlice();
@@ -434,10 +522,10 @@ test "format" {
     }
 
     {
-        var allocating = std.io.Writer.Allocating.init(allocator);
+        var allocating = std.Io.Writer.Allocating.init(allocator);
         defer allocating.deinit();
 
-        const str_value = Self.newString("hello");
+        const str_value = (try String.new("hello")).asValue();
         try str_value.format(&allocating.writer);
 
         const str_output = try allocating.toOwnedSlice();
@@ -446,7 +534,7 @@ test "format" {
     }
 
     {
-        var allocating = std.io.Writer.Allocating.init(allocator);
+        var allocating = std.Io.Writer.Allocating.init(allocator);
         defer allocating.deinit();
 
         const nil_value = Self.nil;
@@ -472,154 +560,29 @@ test "integer round-trip conversions" {
     };
 
     inline for (signed_values) |value| {
-        const ruby_value = Self.from(value);
-        const round_trip = try ruby_value.toInt(c_longlong);
+        const ruby_value = Fixnum.fromInt(@intCast(value)).asValue();
+        const round_trip = try ruby_value.to(c_longlong);
         try testing.expectEqual(value, round_trip);
     }
 
     const unsigned_values = [_]c_ulonglong{
         std.math.maxInt(c_uint),
-        std.math.maxInt(c_ulong),
         @as(c_ulonglong, 1) << 40,
-        (@as(c_ulonglong, 1) << 63) | 12345,
+        (@as(c_ulonglong, 1) << 60) | 12345,
     };
 
     inline for (unsigned_values) |value| {
-        const ruby_value = Self.from(value);
-        const round_trip = try ruby_value.toInt(c_ulonglong);
+        const ruby_value = Fixnum.fromInt(@intCast(@as(Fixnum.Int, @intCast(value)))).asValue();
+        const round_trip = try ruby_value.to(c_ulonglong);
         try testing.expectEqual(value, round_trip);
     }
-}
-
-test "big int round-trip conversions" {
-    const allocator = std.testing.allocator;
-
-    const literals = [_][]const u8{
-        // Small numbers
-        "0",
-        "1",
-        "-1",
-        "2",
-        "-2",
-        // Byte boundaries (i8)
-        "127",
-        "-127",
-        "128",
-        "-128",
-        // Word boundaries (i16)
-        "255",
-        "-255",
-        "256",
-        "-256",
-        "32767",
-        "-32767",
-        "32768",
-        "-32768",
-        // Dword boundaries (i32)
-        "65535",
-        "-65535",
-        "65536",
-        "-65536",
-        "2147483647",
-        "-2147483647",
-        "2147483648",
-        "-2147483648",
-        // Qword boundaries (i64)
-        "4294967295",
-        "-4294967295",
-        "4294967296",
-        "-4294967296",
-        "9223372036854775807",
-        "-9223372036854775807",
-        "9223372036854775808",
-        "-9223372036854775808",
-        // Powers of 2 and near powers of 2
-        "1023",
-        "-1023",
-        "1024",
-        "-1024",
-        "1025",
-        "-1025",
-        "16383",
-        "-16383",
-        "16384",
-        "-16384",
-        "16385",
-        "-16385",
-        // Large numbers
-        "123456789123456789123456789123456789123456789",
-        "-987654321987654321987654321987654321987654321",
-        "1844674407370955161600000000000000000000000000000",
-        // Random large numbers
-        "57896044618658097711785492504343953926634992332820282019728792003956564819967",
-        "-28948022309329048855892746252171976963317496166410141009864396001978282409983",
-        "45671234567890123456789012345678901234567890123456789012345678901234567890",
-        "-98765432109876543210987654321098765432109876543210987654321098765432109876",
-        "11111111111111111111111111111111111111111111111111111111111111111111111111",
-        "-22222222222222222222222222222222222222222222222222222222222222222222222222",
-        "77777777777777777777777777777777777777777777777777777777777777777777777777",
-        "-33333333333333333333333333333333333333333333333333333333333333333333333333",
-        "12345678901234567890123456789012345678901234567890123456789012345678901234",
-        "-98765432109876543210987654321098765432109876543210987654321098765432109",
-        "99999999999999999999999999999999999999999999999999999999999999999999999999",
-        "-88888888888888888888888888888888888888888888888888888888888888888888888888",
-        "13579246801357924680135792468013579246801357924680135792468013579246801357",
-        "-24680135792468013579246801357924680135792468013579246801357924680135792468",
-        "55555555555555555555555555555555555555555555555555555555555555555555555555",
-        "-66666666666666666666666666666666666666666666666666666666666666666666666666",
-        "10000000000000000000000000000000000000000000000000000000000000000000000001",
-        "-10000000000000000000000000000000000000000000000000000000000000000000000002",
-        "31415926535897932384626433832795028841971693993751058209749445923078164062",
-        "-27182818284590452353602874713526624977572470936999595749669676277240766303",
-        "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
-        "57896044618658097711785492504343953926634992332820282019728792003956564819967",
-    };
-
-    inline for (literals) |literal| {
-        const int = try std.fmt.parseInt(i256, literal, 10);
-        const big_int_val = try Self.fromBigInt(int, allocator);
-        var int_ = try big_int_val.toBigInt(allocator);
-        defer int_.deinit();
-        var int_managed = try std.math.big.int.Managed.initSet(allocator, int);
-        defer int_managed.deinit();
-        try std.testing.expectEqual(int_.order(int_managed), .eq);
-    }
-}
-
-test "float round-trip conversions" {
-    const testing = std.testing;
-
-    const floats = [_]f64{
-        0.0,
-        -123.456,
-        98765.4321,
-        std.math.pi,
-        -std.math.tau / 3.0,
-    };
-
-    inline for (floats) |value| {
-        const ruby_value = Self.from(value);
-        const round_trip = try ruby_value.toFloat(f64);
-        try testing.expectEqual(value, round_trip);
-    }
-}
-
-test "string round-trip conversions" {
-    const testing = std.testing;
-
-    const bytes = [_]u8{ 'b', 'y', 't', 'e', 0, 's', '!', 0xff };
-    const slice = bytes[0..];
-
-    const ruby_value = Self.newString(slice);
-    const round_trip = try ruby_value.toString();
-    try testing.expectEqualSlices(u8, slice, round_trip);
 }
 
 test "boolean conversions and truthiness" {
     const testing = std.testing;
 
-    try testing.expect(try Self.from(true).toBool());
-    try testing.expect(!(try Self.from(false).toBool()));
+    try testing.expect(try Self.fromBool(true).to(bool));
+    try testing.expect(!(try Self.fromBool(false).to(bool)));
 
     try testing.expect(Self.true.isTruthy());
     try testing.expect(!Self.false.isTruthy());
@@ -633,47 +596,47 @@ test "boolean conversions and truthiness" {
 test "symbol creation" {
     const testing = std.testing;
 
-    const sym1 = Self.symbol("test");
+    const sym1 = (try Symbol.new("test")).asValue();
     try testing.expectEqual(Type.symbol, sym1.getType());
 
-    const sym2 = Self.symbol("test");
-    try testing.expectEqual(sym1.toRaw(), sym2.toRaw());
+    const sym2 = (try Symbol.new("test")).asValue();
+    try testing.expectEqual(sym1.asRaw(), sym2.asRaw());
 
-    const sym3 = Self.symbol("other");
-    try testing.expect(sym1.toRaw() != sym3.toRaw());
+    const sym3 = (try Symbol.new("other")).asValue();
+    try testing.expect(sym1.asRaw() != sym3.asRaw());
 }
 
 test "order" {
     const testing = std.testing;
 
     {
-        const a = Self.from(5);
-        const b = Self.from(10);
-        const c = Self.from(5);
+        const a = Fixnum.fromComptime(5).asValue();
+        const b = Fixnum.fromComptime(10).asValue();
+        const c = Fixnum.fromComptime(5).asValue();
 
-        try testing.expectEqual(std.math.Order.lt, a.order(b));
-        try testing.expectEqual(std.math.Order.gt, b.order(a));
-        try testing.expectEqual(std.math.Order.eq, a.order(c));
+        try testing.expectEqual(std.math.Order.lt, try a.order(b));
+        try testing.expectEqual(std.math.Order.gt, try b.order(a));
+        try testing.expectEqual(std.math.Order.eq, try a.order(c));
     }
 
     {
-        const f1 = Self.from(3.14);
-        const f2 = Self.from(2.71);
-        const f3 = Self.from(3.14);
+        const f1 = Float.fromComptime(3.14).asValue();
+        const f2 = Float.from(2.71).asValue();
+        const f3 = Float.fromComptime(3.14).asValue();
 
-        try testing.expectEqual(std.math.Order.gt, f1.order(f2));
-        try testing.expectEqual(std.math.Order.lt, f2.order(f1));
-        try testing.expectEqual(std.math.Order.eq, f1.order(f3));
+        try testing.expectEqual(std.math.Order.gt, try f1.order(f2));
+        try testing.expectEqual(std.math.Order.lt, try f2.order(f1));
+        try testing.expectEqual(std.math.Order.eq, try f1.order(f3));
     }
 
     {
-        const s1 = Self.newString("apple");
-        const s2 = Self.newString("banana");
-        const s3 = Self.newString("apple");
+        const s1 = (try String.new("apple")).asValue();
+        const s2 = (try String.new("banana")).asValue();
+        const s3 = (try String.new("apple")).asValue();
 
-        try testing.expectEqual(std.math.Order.lt, s1.order(s2));
-        try testing.expectEqual(std.math.Order.gt, s2.order(s1));
-        try testing.expectEqual(std.math.Order.eq, s1.order(s3));
+        try testing.expectEqual(std.math.Order.lt, try s1.order(s2));
+        try testing.expectEqual(std.math.Order.gt, try s2.order(s1));
+        try testing.expectEqual(std.math.Order.eq, try s1.order(s3));
     }
 }
 
@@ -682,8 +645,8 @@ test "equality functions" {
 
     // isIdentical - checks object identity (same object in memory)
     {
-        const a = Self.from(42);
-        const b = Self.from(42);
+        const a = Fixnum.fromComptime(42).asValue();
+        const b = Fixnum.fromComptime(42).asValue();
         const c = a;
 
         try testing.expect(a.isIdentical(c));
@@ -692,37 +655,248 @@ test "equality functions" {
 
     // isEqual - Ruby's == operator (value equality)
     {
-        const s1 = Self.newString("hello");
-        const s2 = Self.newString("hello");
-        const s3 = Self.newString("world");
+        const s1 = (try String.new("hello")).asValue();
+        const s2 = (try String.new("hello")).asValue();
+        const s3 = (try String.new("world")).asValue();
 
-        try testing.expect(s1.isEqual(s2));
-        try testing.expect(!s1.isEqual(s3));
+        try testing.expect(try s1.isEqual(s2));
+        try testing.expect(!(try s1.isEqual(s3)));
 
-        const n1 = Self.from(100);
-        const n2 = Self.from(100);
-        const n3 = Self.from(200);
-        const n4 = Self.from(200.0);
+        const n1 = Fixnum.fromComptime(100).asValue();
+        const n2 = Fixnum.fromComptime(100).asValue();
+        const n3 = Fixnum.fromComptime(200).asValue();
+        const n4 = Fixnum.fromInt(200).asValue();
 
-        try testing.expect(n1.isEqual(n2));
-        try testing.expect(!n1.isEqual(n3));
-        try testing.expect(n3.isEqual(n4));
+        try testing.expect(try n1.isEqual(n2));
+        try testing.expect(!(try n1.isEqual(n3)));
+        try testing.expect(try n3.isEqual(n4));
     }
 
     // isEql - Ruby's eql? method (stricter equality, checks type and value)
     {
-        const int1 = Self.from(42);
-        const int2 = Self.from(42);
-        const float1 = Self.from(42.0);
+        const int1 = Fixnum.fromComptime(42).asValue();
+        const int2 = Fixnum.fromComptime(42).asValue();
+        const float1 = Float.from(42.0).asValue();
 
         try testing.expect(int1.isEql(int2));
         try testing.expect(!int1.isEql(float1));
 
-        const str1 = Self.newString("test");
-        const str2 = Self.newString("test");
-        const sym = Self.symbol("test");
+        const str1 = (try String.new("test")).asValue();
+        const str2 = (try String.new("test")).asValue();
+        const sym = (try Symbol.new("test")).asValue();
 
         try testing.expect(str1.isEql(str2));
         try testing.expect(!str1.isEql(sym));
     }
+}
+
+test "toI converts values to integer" {
+    const testing = std.testing;
+
+    {
+        const int_val = Fixnum.fromComptime(99).asValue();
+        const i = try int_val.toI();
+        try testing.expectEqual(@as(u8, 99), try i.to(u8));
+    }
+
+    {
+        const int_val = Fixnum.fromComptime(-42).asValue();
+        const i = try int_val.toI();
+        try testing.expectEqual(@as(i64, -42), try i.to(i64));
+    }
+
+    {
+        const int_val = Fixnum.fromInt(1_000_000).asValue();
+        const i = try int_val.toI();
+        try testing.expectEqual(@as(u32, 1_000_000), try i.to(u32));
+    }
+}
+
+test "toI converts objects to integer" {
+    const testing = std.testing;
+
+    _ = crb.rb_eval_string(
+        \\class ToITest
+        \\  def to_i
+        \\    123
+        \\  end
+        \\end
+    );
+    const obj = Self.fromRaw(crb.rb_eval_string("ToITest.new"));
+    const i = try obj.toI();
+    try testing.expectEqual(@as(i32, 123), try i.to(i32));
+}
+
+test "toI returns RubyError for objects without to_i" {
+    const testing = std.testing;
+
+    const sym = (try Symbol.new("test")).asValue();
+    const result = sym.toI();
+    try testing.expectError(Error.RubyError.NoMethodError, result);
+}
+
+test "isKindOf" {
+    const testing = std.testing;
+    const Time = @import("Time.zig");
+
+    {
+        const time = try Time.fromMilliTimestamp(1_700_000_000_000);
+        try testing.expect(time.asValue().isKindOf(Time.getClass()));
+    }
+
+    {
+        const int_val = Fixnum.fromComptime(42).asValue();
+        try testing.expect(!int_val.isKindOf(Time.getClass()));
+    }
+
+    {
+        const str_val = (try String.new("hello")).asValue();
+        try testing.expect(!str_val.isKindOf(Time.getClass()));
+    }
+}
+
+test "toStr converts string-like objects" {
+    const testing = std.testing;
+
+    // String values work with to_str
+    {
+        const str_val = (try String.new("hello")).asValue();
+        const str = try str_val.toStr();
+        try testing.expectEqualStrings("hello", str.toSlice());
+    }
+
+    _ = crb.rb_eval_string(
+        \\class ToStrTest
+        \\  def to_str
+        \\    "custom"
+        \\  end
+        \\end
+    );
+    const obj = Self.fromRaw(crb.rb_eval_string("ToStrTest.new"));
+    const str = try obj.toStr();
+    try testing.expectEqualStrings("custom", str.toSlice());
+}
+
+test "toStr returns TypeError for objects without to_str" {
+    const testing = std.testing;
+
+    // Symbols don't have to_str
+    const sym = (try Symbol.new("test")).asValue();
+    const result = sym.toStr();
+    try testing.expectError(ConversionError.TypeError, result);
+
+    // Integers don't have to_str
+    const int_val = Fixnum.fromComptime(42).asValue();
+    const int_result = int_val.toStr();
+    try testing.expectError(ConversionError.TypeError, int_result);
+}
+
+test "toFlt converts numeric values" {
+    const testing = std.testing;
+
+    // Float values
+    {
+        const float_val = Float.fromComptime(3.14).asValue();
+        const f = try float_val.toFlt();
+        try testing.expectApproxEqAbs(@as(f64, 3.14), f.to(f64), 0.001);
+    }
+
+    // Integer values convert to float
+    {
+        const int_val = Fixnum.fromComptime(42).asValue();
+        const f = try int_val.toFlt();
+        try testing.expectApproxEqAbs(@as(f64, 42.0), f.to(f64), 0.001);
+    }
+}
+
+test "toFlt returns TypeError for non-numeric" {
+    const testing = std.testing;
+
+    const sym = (try Symbol.new("test")).asValue();
+    const result = sym.toFlt();
+    try testing.expectError(ConversionError.TypeError, result);
+}
+
+test "toInt converts integer values" {
+    const testing = std.testing;
+
+    {
+        const int_val = Fixnum.fromComptime(42).asValue();
+        const integer = try int_val.toInt();
+        try testing.expectEqual(@as(i64, 42), try integer.to(i64));
+    }
+}
+
+test "toInt returns TypeError for non-integer" {
+    const testing = std.testing;
+
+    const str_val = (try String.new("hello")).asValue();
+    const result = str_val.toInt();
+    try testing.expectError(ConversionError.TypeError, result);
+}
+
+test "toAry converts array-like objects" {
+    const testing = std.testing;
+
+    // Arrays work with to_ary
+    {
+        const arr = Array.new();
+        arr.pushUnprotected(Fixnum.fromComptime(1).asValue());
+        arr.pushUnprotected(Fixnum.fromComptime(2).asValue());
+        const result = try arr.asValue().toAry();
+        try testing.expectEqual(@as(usize, 2), result.len());
+    }
+
+    // Objects with to_ary work
+    _ = crb.rb_eval_string(
+        \\class ToAryTest
+        \\  def to_ary
+        \\    [1, 2, 3]
+        \\  end
+        \\end
+    );
+    const obj = Self.fromRaw(crb.rb_eval_string("ToAryTest.new"));
+    const arr = try obj.toAry();
+    try testing.expectEqual(@as(usize, 3), arr.len());
+}
+
+test "toAry returns TypeError for objects without to_ary" {
+    const testing = std.testing;
+
+    const int_val = Fixnum.fromComptime(42).asValue();
+    const result = int_val.toAry();
+    try testing.expectError(ConversionError.TypeError, result);
+}
+
+test "toA converts objects with to_a" {
+    const testing = std.testing;
+
+    // Arrays work
+    {
+        const arr = Array.new();
+        arr.pushUnprotected(Fixnum.fromComptime(1).asValue());
+        const result = try arr.asValue().toA();
+        try testing.expectEqual(@as(usize, 1), result.len());
+    }
+
+    // Objects with to_a work
+    _ = crb.rb_eval_string(
+        \\class ToATest
+        \\  def to_a
+        \\    [4, 5, 6]
+        \\  end
+        \\end
+    );
+    const obj = Self.fromRaw(crb.rb_eval_string("ToATest.new"));
+    const arr = try obj.toA();
+    try testing.expectEqual(@as(usize, 3), arr.len());
+}
+
+test "toA returns RubyError for objects without to_a" {
+    const testing = std.testing;
+
+    // Most objects don't have to_a in modern Ruby
+    const int_val = Fixnum.fromComptime(42).asValue();
+    const result = int_val.toA();
+    try testing.expectError(Error.RubyError.NoMethodError, result);
 }

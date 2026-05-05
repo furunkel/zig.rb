@@ -17,6 +17,12 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    const ruby_config = ruby.getConfig(b) catch |err| {
+        std.debug.print("Failed to get Ruby config: {}\n", .{err});
+        return;
+    };
+
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -40,19 +46,15 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .optimize = optimize,
     });
 
     const zig_tests = b.addTest(.{
         .root_module = mod,
         .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .simple },
     });
-    // Configure Zig tests with Ruby (needed because root.zig uses @cImport for Ruby)
-    const ruby_config = ruby.getConfig(b) catch |err| {
-        std.debug.print("Failed to get Ruby config: {}\n", .{err});
-        return;
-    };
     ruby.configureCompile(zig_tests, &ruby_config);
-    zig_tests.linkSystemLibrary("ruby");
+    zig_tests.root_module.linkSystemLibrary("ruby", .{});
 
     const run_zig_tests = b.addRunArtifact(zig_tests);
 
