@@ -6,7 +6,7 @@ const Integer = @import("integer.zig").Integer;
 
 const Self = @This();
 
-pub const Int = std.meta.Int(.signed, @typeInfo(c_long).int.bits - 1);
+pub const Int = @Int(.signed, @typeInfo(c_long).int.bits - 1);
 pub const max_fixnum = std.math.maxInt(Int);
 pub const min_fixnum = std.math.minInt(Int);
 

@@ -132,7 +132,7 @@ pub fn forEach(self: Self, userdata: anytype, comptime callback: fn (Value, Valu
     const Wrapper = struct {
         fn call(key: crb.VALUE, val: crb.VALUE, data: c_ulong) callconv(.c) c_int {
             const user_ptr: *const ArgType = @ptrFromInt(data);
-            return @intFromEnum(callback(Value.fromRaw(key), Value.fromRaw(val), user_ptr.*));
+            return @backingInt(callback(Value.fromRaw(key), Value.fromRaw(val), user_ptr.*));
         }
     };
 
@@ -150,10 +150,11 @@ pub fn fromStruct(allocator: std.mem.Allocator, comptime T: type, value: T) !Sel
     }
 
     var hash = Self.new();
-    inline for (info.@"struct".fields) |field| {
-        const field_value = @field(value, field.name);
-        const ruby_value = try fieldToRuby(allocator, field.type, field_value);
-        hash.setUnprotected(Symbol.newUnprotected(field.name).asValue(), ruby_value);
+    const struct_info = info.@"struct";
+    inline for (struct_info.field_names, struct_info.field_types) |field_name, FieldType| {
+        const field_value = @field(value, field_name);
+        const ruby_value = try fieldToRuby(allocator, FieldType, field_value);
+        hash.setUnprotected(Symbol.newUnprotected(field_name).asValue(), ruby_value);
     }
     return hash;
 }
@@ -183,14 +184,14 @@ fn unionToRuby(allocator: std.mem.Allocator, comptime UnionType: type, comptime 
 
     const union_info = @typeInfo(UnionType).@"union";
 
-    inline for (union_info.fields) |field| {
-        if (std.mem.eql(u8, field.name, tag_name)) {
-            if (field.type == void) {
+    inline for (union_info.field_names, union_info.field_types) |field_name, FieldType| {
+        if (std.mem.eql(u8, field_name, tag_name)) {
+            if (FieldType == void) {
                 return Symbol.newUnprotected(tag_name).asValue();
             } else {
                 var hash = Self.new();
-                const field_value = @field(value, field.name);
-                const ruby_value = try fieldToRuby(allocator, field.type, field_value);
+                const field_value = @field(value, field_name);
+                const ruby_value = try fieldToRuby(allocator, FieldType, field_value);
                 hash.setUnprotected(Symbol.newUnprotected(tag_name).asValue(), ruby_value);
                 return hash.asValue();
             }

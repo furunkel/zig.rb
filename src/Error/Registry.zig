@@ -16,9 +16,9 @@ fn errorSetToKey(err_set: anytype) []const u8 {
     const error_set_info = type_info.error_set;
 
     var key: []const u8 = "";
-    if (error_set_info) |set| {
-        inline for (set) |err_item| {
-            key = key ++ "||" ++ err_item.name;
+    if (error_set_info.error_names) |error_names| {
+        inline for (error_names) |err_name| {
+            key = key ++ "||" ++ err_name;
         }
     }
     return key;

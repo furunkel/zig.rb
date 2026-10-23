@@ -106,7 +106,7 @@ fn raiseInternal(klass: crb.VALUE, message: [:0]const u8) noreturn {
 }
 
 pub fn checkType(value: Value, expected_type: Value.Type) void {
-    crb.Check_Type(value.asRaw(), @intFromEnum(expected_type));
+    crb.Check_Type(value.asRaw(), @backingInt(expected_type));
 }
 
 pub fn raiseArgumentError(message: [:0]const u8) noreturn {
@@ -138,7 +138,7 @@ pub fn from(err: anytype) Self {
     //FIXME: error names should not be longer than this, right?
     //Use an allocator?
     var buf: [512:0]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "{s}", .{err_name}) catch "(error name too long)";
+    const msg = std.fmt.bufPrintSentinel(&buf, "{s}", .{err_name}, 0) catch "(error name too long)";
 
     const exc = crb.rb_exc_new(class.asValue().asRaw(), @ptrCast(msg), @intCast(msg.len));
 

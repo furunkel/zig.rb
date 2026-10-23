@@ -33,13 +33,12 @@ pub fn defineConstant(self: Self, comptime name: [:0]const u8, value: Value) voi
 pub fn defineConstants(self: Self, allocator: std.mem.Allocator, comptime Constants: type) void {
     switch (@typeInfo(Constants)) {
         .@"struct" => |info| {
-            inline for (info.decls) |decl| {
-                const const_name = decl.name;
-                comptime var buf: [decl.name.len:0]u8 = undefined;
-                const const_name_upper = comptime std.ascii.upperString(&buf, const_name);
-                if (comptime std.mem.eql(u8, const_name, const_name_upper)) {
-                    const const_field = @field(Constants, const_name);
-                    self.defineConstant(const_name, Value.allocFrom(allocator, const_field) catch Value.nil);
+            inline for (info.decl_names) |decl_name| {
+                comptime var buf: [decl_name.len:0]u8 = undefined;
+                const decl_name_upper = comptime std.ascii.upperString(&buf, decl_name);
+                if (comptime std.mem.eql(u8, decl_name, decl_name_upper)) {
+                    const decl_field = @field(Constants, decl_name);
+                    self.defineConstant(decl_name, Value.allocFrom(allocator, decl_field) catch Value.nil);
                 }
             }
         },
@@ -64,10 +63,10 @@ pub fn defineFunctions(
 ) void {
     switch (@typeInfo(Functions)) {
         .@"struct" => |info| {
-            inline for (info.decls) |decl| {
-                const func = @field(Functions, decl.name);
+            inline for (info.decl_names) |decl_name| {
+                const func = @field(Functions, decl_name);
                 if (@typeInfo(@TypeOf(func)) == .@"fn") {
-                    self.defineFunction(decl.name, func);
+                    self.defineFunction(decl_name, func);
                 }
             }
         },

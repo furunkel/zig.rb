@@ -1,17 +1,8 @@
-// Test Runner by Karl Seguin
-// This is for the Zig 0.16.
+// This is for the Zig 0.17.
 
-// See https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/eb15512d6ae49663fa9df6c7a9725b20dab43edd
-// for a version that workson Zig 0.15.2.
-
-// See https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/1f317ebc9cd09bc50fd5591d09c34255e15d1d85
-// for a version that workson Zig 0.14.1.
-
-// in your build.zig, you can specify a custom test runner:
-// const tests = b.addTest(.{
-//    .root_module = $MODULE_BEING_TESTED,
-//    .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
-// });
+// Zig 0.16: https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/8e82642093d2f4341fb870d18d1fe5b213b2fd11
+// Zig 0.15.2: https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/eb15512d6ae49663fa9df6c7a9725b20dab43edd
+// Zig 0.14.1: https://gist.github.com/karlseguin/c6bea5b35e4e8d26af6f81c22cb5d76b/1f317ebc9cd09bc50fd5591d09c34255e15d1d85
 
 // in your build.zig, you can specify a custom test runner:
 // const tests = b.addTest(.{
@@ -25,7 +16,7 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 
-const BORDER = "=" ** 80;
+const BORDER: [80]u8 = @splat('=');
 
 // use in custom panic handler
 var current_test: ?[]const u8 = null;
@@ -56,6 +47,10 @@ pub fn main(init: std.process.Init) !void {
 
     Printer.fmt("\r\x1b[0K", .{}); // beginning of line and clear to end of line
 
+    var after_each: std.ArrayList(std.builtin.TestFn) = .empty;
+    defer after_each.deinit(allocator);
+
+    initTestAllocator();
     for (builtin.test_functions) |t| {
         if (isSetup(t)) {
             t.func() catch |err| {
@@ -63,10 +58,14 @@ pub fn main(init: std.process.Init) !void {
                 return err;
             };
         }
+        if (isAfterEach(t)) {
+            try after_each.append(allocator, t);
+        }
     }
+    _ = std.testing.allocator_instance.deinit();
 
     for (builtin.test_functions) |t| {
-        if (isSetup(t) or isTeardown(t)) {
+        if (isSetup(t) or isTeardown(t) or isAfterEach(t)) {
             continue;
         }
 
@@ -93,13 +92,18 @@ pub fn main(init: std.process.Init) !void {
         };
 
         current_test = friendly_name;
-        std.testing.allocator_instance = .{};
+        initTestAllocator();
         const result = t.func();
+
+        for (after_each.items) |ae| {
+            try ae.func();
+        }
+
         current_test = null;
 
         const ns_taken = slowest.endTiming(io, friendly_name);
 
-        if (std.testing.allocator_instance.deinit() == .leak) {
+        if (std.testing.allocator_instance.deinit() > 0) {
             leak += 1;
             Printer.status(.fail, "\n{s}\n\"{s}\" - Memory Leak\n{s}\n", .{ BORDER, friendly_name, BORDER });
         }
@@ -132,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    initTestAllocator();
     for (builtin.test_functions) |t| {
         if (isTeardown(t)) {
             t.func() catch |err| {
@@ -299,10 +304,23 @@ fn isUnnamed(t: std.builtin.TestFn) bool {
     return true;
 }
 
+// std.testing.allocator_instance is undefined until initialized, and
+// beforeAll/afterAll use it too, not just the tests.
+fn initTestAllocator() void {
+    std.testing.allocator_instance = .init(std.heap.page_allocator, .{
+        .canary = 0xc3a701ba,
+        .check_write_after_free = true,
+    });
+}
+
 fn isSetup(t: std.builtin.TestFn) bool {
     return std.mem.endsWith(u8, t.name, "tests:beforeAll");
 }
 
 fn isTeardown(t: std.builtin.TestFn) bool {
     return std.mem.endsWith(u8, t.name, "tests:afterAll");
+}
+
+fn isAfterEach(t: std.builtin.TestFn) bool {
+    return std.mem.endsWith(u8, t.name, "tests:afterEach");
 }

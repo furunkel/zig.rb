@@ -26,23 +26,23 @@ pub fn validate(comptime Data: ?type, comptime zig_func: anytype) void {
                 @compileError("Method must return Value or !Value, got " ++ @typeName(return_type));
             }
 
-            if (info.params.len < 1) {
+            if (info.param_types.len < 1) {
                 @compileError("Methods must at least have one argument");
             }
 
             if (Data) |Data_| {
-                if (info.params[0].type.? != *Data_ and info.params[0].type.? != Value) {
+                if (info.param_types[0] != *Data_ and info.params[0].type.? != Value) {
                     @compileError("First parameter must be *" ++ @typeName(Data) ++ " or Value");
                 }
             } else {
-                if (info.params[0].type.? != Value) {
+                if (info.param_types[0] != Value) {
                     @compileError("First parameter must be Value");
                 }
             }
 
-            inline for (info.params, 0..) |param, i| {
-                if (i > 0 and param.type.? != Value) {
-                    @compileError("Method parameters must be Value, got " ++ @typeName(param.type.?));
+            inline for (info.param_types, 0..) |ParamType, i| {
+                if (i > 0 and ParamType != Value) {
+                    @compileError("Method parameters must be Value, got " ++ @typeName(ParamType));
                 }
             }
         },
@@ -54,7 +54,7 @@ pub fn getArity(comptime zig_func: anytype) usize {
     const T = @TypeOf(zig_func);
     const info = @typeInfo(T).@"fn";
 
-    const arity = info.params.len - 1;
+    const arity = info.param_types.len - 1;
 
     if (arity > 15) {
         @compileError("Methods can have at most 15 parameters (excluding self)");
@@ -72,7 +72,7 @@ pub fn wrap(
     comptime arity: usize,
 ) *const anyopaque {
     const func_info = @typeInfo(@TypeOf(zig_func)).@"fn";
-    const FirstParamType = func_info.params[0].type.?;
+    const FirstParamType = func_info.param_types[0];
 
     const uses_data_ptr = Data != null and FirstParamType == *Data.?;
 
@@ -80,12 +80,14 @@ pub fn wrap(
 
     const Wrapper = struct {
         inline fn callZigFunc(comptime n: usize, rb_self: crb.VALUE, rb_args: anytype) crb.VALUE {
-            const call_arg_types = if (uses_data_ptr)
-                std.meta.Tuple(&[_]type{*Data.?} ++ [_]type{Value} ** n)
-            else
-                std.meta.Tuple(&[_]type{Value} ** (n + 1));
+            const call_arg_types: [n + 1]type = if (uses_data_ptr) blk: {
+                const arg_types: [n]type = @splat(Value);
+                break :blk [_]type{*Data.?} ++ arg_types;
+            } else @splat(Value);
 
-            var call_args: call_arg_types = undefined;
+            const CallArgs = @Tuple(&call_arg_types);
+
+            var call_args: CallArgs = undefined;
             if (uses_data_ptr) {
                 call_args[0] = typed_data.DataType(Data.?).get().unwrap(rb_self);
             } else {
@@ -243,8 +245,8 @@ pub fn defineMethods(
 ) void {
     switch (@typeInfo(Methods)) {
         .@"struct" => |info| {
-            inline for (info.decls) |decl| {
-                const method_name = decl.name;
+            inline for (info.decl_names) |decl_name| {
+                const method_name = decl_name;
                 const func = @field(Methods, method_name);
                 defineMethod(cls, method_name, Data, func);
             }
@@ -293,8 +295,8 @@ pub fn defineSingletonMethods(
 ) void {
     switch (@typeInfo(Methods)) {
         .@"struct" => |info| {
-            inline for (info.decls) |decl| {
-                const method_name = decl.name;
+            inline for (info.decl_names) |decl_name| {
+                const method_name = decl_name;
                 const func = @field(Methods, method_name);
                 defineSingletonMethod(cls, method_name, func);
             }
